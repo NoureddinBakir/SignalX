@@ -1,0 +1,17 @@
+{
+  "name": "signal-x",
+  "version": "0.1.0",
+  "description": "Browser extension that surfaces high-signal posts and creators on X.",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --verbose"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "jest-environment-jsdom": "^30.3.0"
+  }
+}

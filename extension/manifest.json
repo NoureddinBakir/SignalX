@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Signal X",
+  "version": "0.1.0",
+  "description": "Surfaces high-signal posts and creators on X with an inline intelligence HUD. Zero extra API calls.",
+  "permissions": [],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://x.com/*", "https://twitter.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "icons": {}
+}
