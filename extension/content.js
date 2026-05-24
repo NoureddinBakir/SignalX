@@ -750,6 +750,312 @@ function hudAllTweets() {
   });
 }
 
+// ── Sidebar replacement + stats panel ──
+// Hides Articles / Bookmarks / Premium Plus / Explore from X's left nav and
+// drops in our own panel. All stats are derived from the in-memory caches.
+
+const SX_NAV_STYLE_ID = 'signalx-nav-stylesheet';
+function ensureNavStyles() {
+  if (document.getElementById(SX_NAV_STYLE_ID)) return;
+  const s = document.createElement('style');
+  s.id = SX_NAV_STYLE_ID;
+  s.textContent = `
+    /* Hide the four sidebar items the user reclaimed for our panel. */
+    nav[role="navigation"] a[role="link"][href="/explore"],
+    nav[role="navigation"] a[role="link"][href^="/explore"],
+    nav[role="navigation"] a[role="link"][href="/i/bookmarks"],
+    nav[role="navigation"] a[role="link"][href^="/i/bookmarks"],
+    nav[role="navigation"] a[role="link"][href="/i/articles"],
+    nav[role="navigation"] a[role="link"][href^="/i/premium"],
+    nav[role="navigation"] a[role="link"][href="/i/verified-orgs"] {
+      display: none !important;
+    }
+    .sx-stats {
+      margin: 12px 4px;
+      padding: 12px;
+      border-radius: 14px;
+      background: rgba(22, 24, 28, 0.9);
+      border: 1px solid #2f3336;
+      color: #e7e9ea;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+      font-size: 12px;
+      line-height: 1.35;
+      display: flex; flex-direction: column; gap: 10px;
+      user-select: none;
+    }
+    .sx-stats__title {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: #71767b; font-weight: 600;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .sx-stats__title .sx-stats__pulse {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      background: #10b981; animation: sx-pulse 1.6s ease-in-out infinite;
+    }
+    .sx-stats__section {
+      display: flex; flex-direction: column; gap: 6px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid rgba(47, 51, 54, 0.7);
+    }
+    .sx-stats__section:last-child { border-bottom: none; padding-bottom: 0; }
+    .sx-stats__section-h {
+      font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: #71767b; font-weight: 600; margin-bottom: 2px;
+    }
+    .sx-stats__row {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 8px;
+    }
+    .sx-stats__label { color: #71767b; font-size: 11px; }
+    .sx-stats__val   {
+      color: #e7e9ea; font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .sx-stats__val--accent { color: #1D9BF0; }
+    .sx-stats__val--good   { color: #34d399; }
+    .sx-stats__val--bad    { color: #fb7185; }
+    .sx-stats__val--warn   { color: #fbbf24; }
+    .sx-stats__bar {
+      width: 100%; height: 4px; border-radius: 4px;
+      background: rgba(47, 51, 54, 0.7); position: relative; overflow: hidden;
+    }
+    .sx-stats__bar > span {
+      display: block; height: 100%; border-radius: 4px;
+      transition: width 200ms ease;
+    }
+    .sx-stats__chip-row {
+      display: flex; flex-wrap: wrap; gap: 4px;
+    }
+    .sx-stats__chip {
+      font-size: 10px;
+      padding: 1px 6px; border-radius: 4px;
+      background: rgba(245, 158, 11, 0.10); color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.20);
+      white-space: nowrap;
+    }
+    .sx-stats__empty {
+      color: #71767b; font-style: italic; font-size: 11px; line-height: 1.4;
+    }
+    .sx-stats__footer {
+      font-size: 9px; color: #536471; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: 0.04em; text-align: right;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(s);
+}
+
+function getCurrentHandle() {
+  // X exposes the signed-in user's profile link in the bottom nav.
+  const a = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')
+         || document.querySelector('a[aria-label="Profile"][role="link"]');
+  if (!a) return null;
+  const href = a.getAttribute('href') || '';
+  const m = href.match(/^\/([A-Za-z0-9_]{1,15})$/);
+  return m ? m[1] : null;
+}
+
+function computeFeedHealth(currentHandle) {
+  let totalUsers = 0, mutuals = 0, youFollow = 0, followsYou = 0, strangers = 0;
+  const affiliations = new Map();
+  for (const u of userCache.values()) {
+    if (currentHandle && u.screenName.toLowerCase() === currentHandle.toLowerCase()) continue;
+    totalUsers += 1;
+    if (u.youFollow && u.followsYou) mutuals += 1;
+    else if (u.youFollow) youFollow += 1;
+    else if (u.followsYou) followsYou += 1;
+    else strangers += 1;
+    if (u.affiliateLabel) affiliations.set(u.affiliateLabel, (affiliations.get(u.affiliateLabel) || 0) + 1);
+  }
+
+  let totalTweets = 0, totalViews = 0, sigSum = 0, sigCount = 0;
+  let noise = 0, high = 0, limited = 0;
+  for (const t of tweetCache.values()) {
+    totalTweets += 1;
+    totalViews += t.views || 0;
+    if (t.visibilityLimited) limited += 1;
+    // We need to score against the author — find them in userCache via the tweet's user_id_str? We don't store that.
+    // Approximation: score using a generic user shell. Or skip if we can't pair.
+  }
+  // Score by walking userCache and matching to tweets — but we don't link them.
+  // Alternative: re-score by checking every tweet's nearest user. For now use a heuristic:
+  // count low-signal as tweets where visibilityLimited OR (no relationship author).
+  // This is rough — for a precise feed score we'd need tweet→user mapping (todo).
+  // For now: count visibilityLimited as low-signal proxy + Premium-blue-low-followers in cache.
+  for (const u of userCache.values()) {
+    if (currentHandle && u.screenName.toLowerCase() === currentHandle.toLowerCase()) continue;
+    // Build a fake tweet shell so computeSignal runs (it accepts no-tweet too).
+    const sig = computeSignal(u, null);
+    sigSum += sig.score;
+    sigCount += 1;
+    if (sig.score < 3) noise += 1;
+    else if (sig.score >= 8) high += 1;
+  }
+  const avgSig = sigCount ? sigSum / sigCount : 5;
+  const noisePct = sigCount ? Math.round((noise / sigCount) * 100) : 0;
+  const highPct  = sigCount ? Math.round((high / sigCount) * 100) : 0;
+
+  const topAffil = [...affiliations.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  return {
+    totalUsers, mutuals, youFollow, followsYou, strangers,
+    totalTweets, totalViews, limited,
+    avgSig, noisePct, highPct,
+    topAffil,
+  };
+}
+
+function findSidebarMountPoint() {
+  // Inject inside the same nav so it sticks (X's nav is position: sticky).
+  return document.querySelector('header[role="banner"] nav[role="navigation"]');
+}
+
+let statsPanelEl = null;
+function renderStatsPanel() {
+  ensureNavStyles();
+  const mount = findSidebarMountPoint();
+  if (!mount) return;
+
+  // Re-attach if X re-rendered the sidebar and detached us.
+  if (statsPanelEl && !document.contains(statsPanelEl)) statsPanelEl = null;
+  if (!statsPanelEl) {
+    statsPanelEl = document.createElement('aside');
+    statsPanelEl.className = 'sx-stats';
+    statsPanelEl.setAttribute('data-signalx-stats', '1');
+    observerPaused = true;
+    mount.appendChild(statsPanelEl);
+    observerPaused = false;
+  }
+
+  const handle = getCurrentHandle();
+  const me = handle ? userCache.get(handle) : null;
+  const f = computeFeedHealth(handle);
+
+  observerPaused = true;
+  statsPanelEl.innerHTML = '';
+
+  // Title
+  const title = document.createElement('div');
+  title.className = 'sx-stats__title';
+  title.appendChild(Object.assign(document.createElement('span'), { textContent: 'Signal X · Live' }));
+  title.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__pulse' }));
+  statsPanelEl.appendChild(title);
+
+  // ── Your profile ──
+  const meSec = document.createElement('div');
+  meSec.className = 'sx-stats__section';
+  const meH = Object.assign(document.createElement('div'), { className: 'sx-stats__section-h', textContent: 'Your profile' });
+  meSec.appendChild(meH);
+  if (me) {
+    const rows = [
+      ['Followers', compact(me.followers)],
+      ['Following', compact(me.following)],
+      ['Posts', compact(me.tweets)],
+      ['Lists', compact(me.listed)],
+      ['Media', compact(me.media)],
+      ['Age', me.age || '—'],
+    ];
+    for (const [k, v] of rows) {
+      const r = document.createElement('div'); r.className = 'sx-stats__row';
+      r.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__label', textContent: k }));
+      r.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__val', textContent: v }));
+      meSec.appendChild(r);
+    }
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'sx-stats__empty';
+    empty.textContent = handle
+      ? `Visit @${handle} once to populate.`
+      : 'Sign in to populate your profile stats.';
+    meSec.appendChild(empty);
+  }
+  statsPanelEl.appendChild(meSec);
+
+  // ── Feed health ──
+  const fh = document.createElement('div');
+  fh.className = 'sx-stats__section';
+  fh.appendChild(Object.assign(document.createElement('div'), { className: 'sx-stats__section-h', textContent: 'Feed health (session)' }));
+
+  // Avg signal with color bar
+  const sigRow = document.createElement('div'); sigRow.className = 'sx-stats__row';
+  sigRow.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__label', textContent: 'Avg signal' }));
+  const sigVal = document.createElement('span');
+  sigVal.className = 'sx-stats__val ' + (f.avgSig >= 7 ? 'sx-stats__val--good' : f.avgSig < 4 ? 'sx-stats__val--bad' : 'sx-stats__val--warn');
+  sigVal.textContent = f.avgSig.toFixed(1) + ' / 10';
+  sigRow.appendChild(sigVal);
+  fh.appendChild(sigRow);
+
+  const bar = document.createElement('div'); bar.className = 'sx-stats__bar';
+  const fill = document.createElement('span');
+  fill.style.width = Math.min(100, Math.round(f.avgSig * 10)) + '%';
+  fill.style.background = f.avgSig >= 7 ? '#10b981' : f.avgSig < 4 ? '#fb7185' : '#fbbf24';
+  bar.appendChild(fill);
+  fh.appendChild(bar);
+
+  const rows2 = [
+    ['Posts scanned', String(f.totalTweets)],
+    ['Total reach', compact(f.totalViews) + ' views'],
+    ['High signal', f.highPct + '%', 'good'],
+    ['Noise', f.noisePct + '%', f.noisePct > 25 ? 'bad' : 'warn'],
+    ['X-limited', String(f.limited), f.limited > 0 ? 'bad' : null],
+  ];
+  for (const [k, v, mod] of rows2) {
+    const r = document.createElement('div'); r.className = 'sx-stats__row';
+    r.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__label', textContent: k }));
+    const vv = Object.assign(document.createElement('span'), { textContent: v });
+    vv.className = 'sx-stats__val' + (mod ? ' sx-stats__val--' + mod : '');
+    r.appendChild(vv);
+    fh.appendChild(r);
+  }
+  statsPanelEl.appendChild(fh);
+
+  // ── Network ──
+  const net = document.createElement('div'); net.className = 'sx-stats__section';
+  net.appendChild(Object.assign(document.createElement('div'), { className: 'sx-stats__section-h', textContent: 'Network this session' }));
+  const netRows = [
+    ['Mutuals', f.mutuals, 'accent'],
+    ['You follow', f.youFollow, 'accent'],
+    ['Follows you', f.followsYou, null],
+    ['Strangers', f.strangers, null],
+  ];
+  for (const [k, v, mod] of netRows) {
+    const r = document.createElement('div'); r.className = 'sx-stats__row';
+    r.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__label', textContent: k }));
+    const vv = Object.assign(document.createElement('span'), { textContent: String(v) });
+    vv.className = 'sx-stats__val' + (mod ? ' sx-stats__val--' + mod : '');
+    r.appendChild(vv);
+    net.appendChild(r);
+  }
+  statsPanelEl.appendChild(net);
+
+  // ── Top affiliations ──
+  if (f.topAffil.length) {
+    const aff = document.createElement('div'); aff.className = 'sx-stats__section';
+    aff.appendChild(Object.assign(document.createElement('div'), { className: 'sx-stats__section-h', textContent: 'Top affiliations' }));
+    const chips = document.createElement('div'); chips.className = 'sx-stats__chip-row';
+    for (const [name, n] of f.topAffil) {
+      chips.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__chip', textContent: `${name} · ${n}` }));
+    }
+    aff.appendChild(chips);
+    statsPanelEl.appendChild(aff);
+  }
+
+  // Footer
+  statsPanelEl.appendChild(Object.assign(document.createElement('div'), { className: 'sx-stats__footer', textContent: 'zero_api_calls · in_memory_only' }));
+  observerPaused = false;
+}
+
+// Re-render on relevant DOM changes (sidebar re-mounts on route change).
+let statsPending = false;
+function scheduleStatsRender() {
+  if (statsPending) return;
+  statsPending = true;
+  requestAnimationFrame(() => {
+    statsPending = false;
+    try { renderStatsPanel(); } catch (e) { console.warn('[Signal X] stats render error:', e.message); }
+  });
+}
+
 // ── Intercept X's XHR ──
 
 const origOpen = XMLHttpRequest.prototype.open;
@@ -774,6 +1080,7 @@ XMLHttpRequest.prototype.send = function (...args) {
         if (uAdded > 0 || tAdded > 0) {
           console.log(`[Signal X] +${uAdded} users, +${tAdded} tweets (totals: ${userCache.size}u / ${tweetCache.size}t)`);
           requestAnimationFrame(hudAllTweets);
+          scheduleStatsRender();
         }
       } catch {}
     }
@@ -800,6 +1107,7 @@ window.fetch = async function (...args) {
         if (uAdded > 0 || tAdded > 0) {
           console.log(`[Signal X][fetch] +${uAdded} users, +${tAdded} tweets (totals: ${userCache.size}u / ${tweetCache.size}t)`);
           requestAnimationFrame(hudAllTweets);
+          scheduleStatsRender();
         }
       }).catch(() => {});
     } catch {}
@@ -811,7 +1119,10 @@ window.fetch = async function (...args) {
 
 let observerPaused = false;
 const observer = new MutationObserver(() => {
-  if (!observerPaused) hudAllTweets();
+  if (observerPaused) return;
+  hudAllTweets();
+  // Re-attach the stats panel if X re-rendered the sidebar (route change).
+  if (!document.querySelector('[data-signalx-stats]')) scheduleStatsRender();
 });
 if (document.body) {
   observer.observe(document.body, { childList: true, subtree: true });
