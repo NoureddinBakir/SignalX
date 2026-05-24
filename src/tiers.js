@@ -7,8 +7,26 @@ const TIERS = [
   { min: 0,     label: '',     color: '#495057', bg: 'transparent',                border: 'transparent',              glow: 'transparent' },
 ];
 
+// View / interaction tiers. Color-coded from cool (low) → hot (viral) so a
+// glance at the bottom strip tells you whether a post is background noise or
+// already moving.
+const VIEW_TIERS = [
+  { min: 500000, label: '500K+', color: '#E03131', bg: 'rgba(224, 49, 49, 0.12)', border: 'rgba(224, 49, 49, 0.55)' },
+  { min: 300000, label: '300K+', color: '#FD7E14', bg: 'rgba(253, 126, 20, 0.10)', border: 'rgba(253, 126, 20, 0.50)' },
+  { min: 100000, label: '100K+', color: '#FAB005', bg: 'rgba(250, 176, 5, 0.10)',  border: 'rgba(250, 176, 5, 0.50)' },
+  { min: 10000,  label: '10K+',  color: '#2F9E44', bg: 'rgba(47, 158, 68, 0.08)',  border: 'rgba(47, 158, 68, 0.40)' },
+  { min: 5000,   label: '5K+',   color: '#1098AD', bg: 'rgba(16, 152, 173, 0.07)', border: 'rgba(16, 152, 173, 0.35)' },
+  { min: 1000,   label: '1K+',   color: '#1C7ED6', bg: 'rgba(28, 126, 214, 0.06)', border: 'rgba(28, 126, 214, 0.30)' },
+  { min: 0,      label: '<1K',   color: '#868E96', bg: 'rgba(134, 142, 150, 0.05)', border: 'transparent' },
+];
+
 function getTier(followers) {
   return TIERS.find(t => followers >= t.min) || TIERS[TIERS.length - 1];
+}
+
+function getViewTier(views) {
+  const n = Number(views) || 0;
+  return VIEW_TIERS.find(t => n >= t.min) || VIEW_TIERS[VIEW_TIERS.length - 1];
 }
 
 function compact(n) {
@@ -27,4 +45,4 @@ function accountAge(createdAt) {
   return `${months}mo`;
 }
 
-module.exports = { getTier, compact, accountAge, TIERS };
+module.exports = { getTier, getViewTier, compact, accountAge, TIERS, VIEW_TIERS };

@@ -1,4 +1,4 @@
-const { getTier, compact, accountAge } = require('../src/tiers');
+const { getTier, getViewTier, compact, accountAge, VIEW_TIERS } = require('../src/tiers');
 
 describe('getTier', () => {
   test('10K+ tier for >= 10000 followers', () => {
@@ -59,6 +59,64 @@ describe('compact', () => {
     expect(compact(999)).toBe('999');
     expect(compact(0)).toBe('0');
     expect(compact(42)).toBe('42');
+  });
+});
+
+describe('getViewTier', () => {
+  test('500K+ tier for viral posts', () => {
+    expect(getViewTier(500000).label).toBe('500K+');
+    expect(getViewTier(1_200_000).label).toBe('500K+');
+    expect(getViewTier(500000).color).toBe('#E03131');
+  });
+
+  test('300K+ tier', () => {
+    expect(getViewTier(300000).label).toBe('300K+');
+    expect(getViewTier(499999).label).toBe('300K+');
+  });
+
+  test('100K+ tier', () => {
+    expect(getViewTier(100000).label).toBe('100K+');
+    expect(getViewTier(299999).label).toBe('100K+');
+  });
+
+  test('10K+ tier', () => {
+    expect(getViewTier(10000).label).toBe('10K+');
+    expect(getViewTier(99999).label).toBe('10K+');
+  });
+
+  test('5K+ tier', () => {
+    expect(getViewTier(5000).label).toBe('5K+');
+    expect(getViewTier(9999).label).toBe('5K+');
+  });
+
+  test('1K+ tier', () => {
+    expect(getViewTier(1000).label).toBe('1K+');
+    expect(getViewTier(4999).label).toBe('1K+');
+  });
+
+  test('<1K baseline tier', () => {
+    expect(getViewTier(0).label).toBe('<1K');
+    expect(getViewTier(999).label).toBe('<1K');
+  });
+
+  test('coerces strings (views.count arrives as a string)', () => {
+    expect(getViewTier('150000').label).toBe('100K+');
+    expect(getViewTier('not-a-number').label).toBe('<1K');
+  });
+
+  test('exact boundary values', () => {
+    expect(getViewTier(500000).label).toBe('500K+');
+    expect(getViewTier(499999).label).toBe('300K+');
+    expect(getViewTier(100000).label).toBe('100K+');
+    expect(getViewTier(99999).label).toBe('10K+');
+    expect(getViewTier(1000).label).toBe('1K+');
+    expect(getViewTier(999).label).toBe('<1K');
+  });
+
+  test('VIEW_TIERS are sorted descending by min', () => {
+    for (let i = 1; i < VIEW_TIERS.length; i++) {
+      expect(VIEW_TIERS[i - 1].min).toBeGreaterThan(VIEW_TIERS[i].min);
+    }
   });
 });
 

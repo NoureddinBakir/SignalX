@@ -18,6 +18,23 @@ function getTier(followers) {
   return TIERS.find(t => followers >= t.min) || TIERS[TIERS.length - 1];
 }
 
+// ── View / Interaction Tiers ──
+// Cool → hot scale so a viral post stands out at a glance.
+const VIEW_TIERS = [
+  { min: 500000, label: '500K+', color: '#E03131', bg: 'rgba(224, 49, 49, 0.12)',  border: 'rgba(224, 49, 49, 0.55)' },
+  { min: 300000, label: '300K+', color: '#FD7E14', bg: 'rgba(253, 126, 20, 0.10)', border: 'rgba(253, 126, 20, 0.50)' },
+  { min: 100000, label: '100K+', color: '#FAB005', bg: 'rgba(250, 176, 5, 0.10)',  border: 'rgba(250, 176, 5, 0.50)' },
+  { min: 10000,  label: '10K+',  color: '#2F9E44', bg: 'rgba(47, 158, 68, 0.08)',  border: 'rgba(47, 158, 68, 0.40)' },
+  { min: 5000,   label: '5K+',   color: '#1098AD', bg: 'rgba(16, 152, 173, 0.07)', border: 'rgba(16, 152, 173, 0.35)' },
+  { min: 1000,   label: '1K+',   color: '#1C7ED6', bg: 'rgba(28, 126, 214, 0.06)', border: 'rgba(28, 126, 214, 0.30)' },
+  { min: 0,      label: '<1K',   color: '#868E96', bg: 'rgba(134, 142, 150, 0.05)', border: 'transparent' },
+];
+
+function getViewTier(views) {
+  const n = Number(views) || 0;
+  return VIEW_TIERS.find(t => n >= t.min) || VIEW_TIERS[VIEW_TIERS.length - 1];
+}
+
 // ── Bio keyword tags ──
 
 const BIO_KEYWORDS = [
@@ -207,15 +224,57 @@ function accountAge(createdAt) {
   return `${months}mo`;
 }
 
-// ── User Cache ──
+// ── User + Tweet Cache ──
 
 const userCache = new Map(); // screenName -> full user data object
+const tweetCache = new Map(); // tweet id_str -> engagement + content + flags
+
+function accountAgeMonths(createdAt) {
+  if (!createdAt) return 9999;
+  const created = new Date(createdAt);
+  if (isNaN(created)) return 9999;
+  return Math.floor((Date.now() - created) / (30.44 * 24 * 60 * 60 * 1000));
+}
+
+function cacheTweet(obj, flags) {
+  const id = obj.rest_id || obj.legacy?.id_str;
+  if (!id) return;
+  const views = Number(obj.views?.count ?? 0) || 0;
+  const data = {
+    views,
+    likes: obj.legacy?.favorite_count ?? 0,
+    retweets: obj.legacy?.retweet_count ?? 0,
+    replies: obj.legacy?.reply_count ?? 0,
+    quotes: obj.legacy?.quote_count ?? 0,
+    bookmarks: obj.legacy?.bookmark_count ?? 0,
+    fullText: obj.legacy?.full_text || '',
+    lang: obj.legacy?.lang || '',
+    isQuote: obj.legacy?.is_quote_status || false,
+    hasMedia: !!(obj.legacy?.entities?.media?.length || obj.legacy?.extended_entities?.media?.length),
+    sensitive: obj.legacy?.possibly_sensitive || false,
+    visibilityLimited: !!(flags && flags.visibilityLimited),
+  };
+  const existing = tweetCache.get(id);
+  // Keep the richest entry: highest views, OR add visibility flag if discovered later
+  if (existing && existing.views >= views && !data.visibilityLimited) return;
+  tweetCache.set(id, { ...existing, ...data });
+}
 
 function findUsersInResponse(obj, depth) {
   if (!obj || typeof obj !== 'object' || depth > 15) return;
   if (Array.isArray(obj)) {
     for (const item of obj) findUsersInResponse(item, depth + 1);
     return;
+  }
+  // X wraps algorithmically-limited tweets in TweetWithVisibilityResults.
+  // The inner .tweet is a real Tweet object — record it with the limit flag.
+  if (obj.__typename === 'TweetWithVisibilityResults' && obj.tweet) {
+    cacheTweet(obj.tweet, { visibilityLimited: true });
+    // fall through to walk children (nested users / quoted tweets)
+  }
+  if (obj.__typename === 'Tweet' && (obj.rest_id || obj.legacy?.id_str)) {
+    cacheTweet(obj);
+    // fall through — a tweet object can still nest user objects (quoted authors etc.)
   }
   if (obj.__typename === 'User' && obj.core?.screen_name) {
     const sn = obj.core.screen_name;
@@ -225,6 +284,7 @@ function findUsersInResponse(obj, depth) {
       const bio = obj.legacy?.description || obj.profile_bio?.description || '';
       const followers = obj.legacy?.followers_count ?? 0;
       const following = obj.legacy?.friends_count ?? 0;
+      const createdAt = obj.core?.created_at || '';
       userCache.set(sn, {
         screenName: sn,
         name: obj.core.name || '',
@@ -239,11 +299,14 @@ function findUsersInResponse(obj, depth) {
         tweets: obj.legacy?.statuses_count ?? 0,
         media: obj.legacy?.media_count ?? 0,
         likes: obj.legacy?.favourites_count ?? 0,
-        createdAt: obj.core?.created_at || '',
-        age: accountAge(obj.core?.created_at),
+        createdAt,
+        age: accountAge(createdAt),
+        ageMonths: accountAgeMonths(createdAt),
         isBlueVerified: obj.is_blue_verified || false,
         isVerified: obj.verification?.verified || false,
+        verifiedType: obj.verification?.verified_type || '',
         professionalType: obj.professional?.professional_type || '',
+        affiliateLabel: obj.affiliates_highlighted_label?.label?.description || '',
         followsYou: obj.relationship_perspectives?.followed_by || false,
         youFollow: obj.relationship_perspectives?.following || false,
         defaultAvatar: obj.legacy?.default_profile_image || false,
@@ -254,6 +317,54 @@ function findUsersInResponse(obj, depth) {
     return;
   }
   for (const val of Object.values(obj)) findUsersInResponse(val, depth + 1);
+}
+
+// ── Signal scoring ──
+// Computes 0-10 trust/quality score per tweet from the data we cache.
+// Low scores fade the card so your eye skips it.
+
+const SHOCK_REGEX = /\b(BREAKING|MIRACLE|EXPOSED|REVEALED|SHOCKING|UNBELIEVABLE|INSANE|YOU WON'T BELIEVE|MUST SEE|GONE WRONG|GUYS|🚨|⚠️|🔥🔥)\b/i;
+const EMOJI_REGEX = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu;
+
+function computeSignal(u, t) {
+  let score = 5;
+  const reasons = [];
+  if (!u) return { score: 5, opacity: 1.0, reasons: [] };
+
+  // ── Negative signals ──
+  if (t && t.visibilityLimited) { score -= 4; reasons.push('X-limited'); }
+  if (u.defaultAvatar) { score -= 3; reasons.push('no pic'); }
+  if (u.isBlueVerified && u.followers < 5000) { score -= 2; reasons.push('blue+low-followers'); }
+  if (u.ageMonths < 6) { score -= 2; reasons.push('new acct'); }
+  if (u.following > 0 && u.followers / u.following < 0.5 && u.tweets > 5000) {
+    score -= 2; reasons.push('follow-farm');
+  }
+  if (!u.bio && u.isBlueVerified) { score -= 2; reasons.push('empty bio + blue'); }
+  if (t && u.followers > 0 && t.views > 0 && t.views / u.followers > 50) {
+    score -= 3; reasons.push('algo boost');
+  }
+  if (t && t.fullText) {
+    const text = t.fullText;
+    if (SHOCK_REGEX.test(text)) { score -= 2; reasons.push('shock words'); }
+    const words = text.split(/\s+/).filter(w => w.length > 1 && /[A-Za-z]/.test(w));
+    if (words.length > 5) {
+      const caps = words.filter(w => w === w.toUpperCase()).length;
+      if (caps / words.length > 0.5) { score -= 2; reasons.push('shouting'); }
+    }
+    const emojis = (text.match(EMOJI_REGEX) || []).length;
+    if (text.length > 0 && emojis / text.length > 0.05) { score -= 1; reasons.push('emoji spam'); }
+  }
+
+  // ── Positive signals ──
+  if (u.verifiedType === 'Business') { score += 1; reasons.push('business'); }
+  if (u.affiliateLabel) { score += 1; reasons.push(`@${u.affiliateLabel}`); }
+  if (u.followsYou) { score += 2; reasons.push('follows you'); }
+  if (u.youFollow) { score += 3; reasons.push('you follow'); }
+  if (u.isVerified) { score += 1; reasons.push('legacy verified'); }
+
+  score = Math.max(0, Math.min(10, score));
+  const opacity = score >= 5 ? 1.0 : score >= 3 ? 0.65 : 0.4;
+  return { score, opacity, reasons };
 }
 
 // ── HUD Injection ──
@@ -273,30 +384,146 @@ function extractUsername(tweet) {
   return null;
 }
 
-function makePill(text, bg, color) {
-  const s = document.createElement('span');
-  s.textContent = text;
-  s.style.cssText = `padding:0 5px;border-radius:4px;font-size:10px;font-weight:600;background:${bg};color:${color};line-height:1.6;white-space:nowrap;`;
-  return s;
+function extractTweetId(tweet) {
+  // The outer article's first <time> sits inside <a href="/user/status/ID">.
+  // Inner articles (quote tweets) come after, so the first match is the tweet itself.
+  const timeEl = tweet.querySelector('time');
+  const link = timeEl?.closest('a[href*="/status/"]');
+  if (!link) return null;
+  const match = link.getAttribute('href').match(/\/status\/(\d+)/);
+  return match ? match[1] : null;
 }
 
-function makeDot() {
-  const d = document.createElement('span');
-  d.style.cssText = 'color:#6B7280;font-size:10px;margin:0 1px;';
-  d.textContent = '\u00B7';
-  return d;
-}
+// ── Signal HUD (AI Studio design, ported verbatim) ──
+// Tier-shaded container above each tweet. Two-row strip + conditional
+// level-3 reasoning bar. Inline SVG icons (lucide). One-time stylesheet
+// injection so we don't need a build step.
 
-function makeStrip(side) {
-  const el = document.createElement('div');
-  el.setAttribute('data-signalx-hud', side);
-  el.style.cssText = `
-    display:flex; align-items:center; flex-wrap:wrap; gap:4px;
-    padding:4px 12px;
-    font-family:-apple-system,BlinkMacSystemFont,sans-serif;
-    border-${side === 'top' ? 'bottom' : 'top'}:1px solid rgba(134,142,150,0.12);
+const SX_STYLE_ID = 'signalx-stylesheet';
+function ensureStyles() {
+  if (document.getElementById(SX_STYLE_ID)) return;
+  const s = document.createElement('style');
+  s.id = SX_STYLE_ID;
+  s.textContent = `
+  @keyframes sx-pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.5 } }
+  @keyframes sx-ping  {
+    75%, 100% { transform: scale(2); opacity: 0 }
+  }
+  .sx-hud {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+    user-select: none;
+    padding: 6px 16px;
+    border-top-left-radius: 12px;
+    border-top-right-radius: 12px;
+    display: flex; flex-direction: column; gap: 6px;
+    transition: all 150ms ease;
+  }
+  .sx-hud--mid  { background: rgba(22, 24, 28, 0.95); border-bottom: 1px solid #2f3336; color: #71767b; }
+  .sx-hud--high { background: rgba(59, 130, 246, 0.10); border-bottom: 1px solid rgba(59, 130, 246, 0.30); color: #60a5fa; }
+  .sx-hud--low  { background: rgba(127, 29, 29, 0.20); border-bottom: 1px solid rgba(127, 29, 29, 0.20); color: #f87171; }
+  .sx-row {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    font-size: 11px; letter-spacing: -0.01em;
+  }
+  .sx-row--secondary { font-size: 10px; color: rgba(163, 163, 163, 0.8); gap: 4px 12px; }
+  .sx-row--spread { justify-content: space-between; }
+  .sx-pill {
+    display: inline-flex; align-items: center; gap: 3px;
+    padding: 1px 6px; border-radius: 6px; border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .sx-pill--score {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-weight: 700; font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .sx-pill--score-high { background: rgba(16, 185, 129, 0.10); color: #34d399; border-color: rgba(16, 185, 129, 0.20); }
+  .sx-pill--score-low  { background: rgba(244, 63, 94, 0.10);  color: #fb7185; border-color: rgba(244, 63, 94, 0.20); }
+  .sx-pill--score-mid  { background: rgba(115, 115, 115, 0.10); color: #a3a3a3; border-color: rgba(115, 115, 115, 0.20); }
+  .sx-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
+  .sx-dot--pulse { animation: sx-pulse 1.6s ease-in-out infinite; }
+  .sx-pill--legacy  { background: rgba(245, 158, 11, 0.10); color: #f59e0b; border-color: rgba(245, 158, 11, 0.20); font-weight: 500; font-size: 10px; padding: 1px 4px; }
+  .sx-pill--blue    { background: rgba(14, 165, 233, 0.10); color: #38bdf8; border-color: rgba(14, 165, 233, 0.25); font-size: 10px; padding: 1px 4px; }
+  .sx-pill--rel     { background: rgba(14, 165, 233, 0.10); color: #38bdf8; border-color: rgba(14, 165, 233, 0.15); font-weight: 500; font-size: 10px; padding: 1px 4px; }
+  .sx-pill--org     { background: rgba(245, 158, 11, 0.10); color: #fbbf24; border-color: rgba(245, 158, 11, 0.20); font-weight: 600; font-size: 10px; padding: 1px 4px; }
+  .sx-pill--flag    { background: rgba(115, 115, 115, 0.05); color: #a3a3a3; border-color: rgba(115, 115, 115, 0.10); font-size: 10px; padding: 1px 4px; }
+  .sx-pill--prof    { background: rgba(115, 115, 115, 0.05); color: #d4d4d4; border-color: rgba(115, 115, 115, 0.10); font-size: 9px; padding: 1px 4px; }
+  .sx-pill--view {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.05em; font-size: 11px;
+  }
+  .sx-tag { font-size: 9px; padding: 0 4px; border-radius: 4px; border: 1px solid; text-transform: uppercase; letter-spacing: 0.04em; }
+  .sx-tag--hv  { background: rgba(251, 191, 36, 0.10); color: #fbbf24; border-color: rgba(251, 191, 36, 0.20); font-weight: 600; }
+  .sx-tag--reg { background: rgba(115, 115, 115, 0.05); color: #a3a3a3; border-color: rgba(115, 115, 115, 0.10); }
+  .sx-stat { display: inline-flex; align-items: center; gap: 3px; }
+  .sx-stat-label { color: #737373; }
+  .sx-stat-val   { color: #d4d4d4; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; }
+  .sx-stat-val--accent { color: #2dd4bf; font-weight: 600; }
+  .sx-l3 {
+    margin-top: 4px;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    padding: 4px 6px; border-radius: 4px; font-size: 10px;
+    line-height: 1.25;
+  }
+  .sx-l3--low  { background: rgba(244, 63, 94, 0.05);  border: 1px solid rgba(244, 63, 94, 0.12);  color: rgba(252, 165, 165, 1); }
+  .sx-l3--high { background: rgba(16, 185, 129, 0.04); border: 1px solid rgba(16, 185, 129, 0.10); color: rgba(52, 211, 153, 0.9); }
+  .sx-l3-label  { font-weight: 600; text-transform: uppercase; font-size: 9px; letter-spacing: 0.07em; flex-shrink: 0; }
+  .sx-l3-label--low  { color: rgba(251, 113, 133, 0.9); }
+  .sx-l3-label--high { color: #10b981; }
+  .sx-l3-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9px; letter-spacing: -0.02em; flex-shrink: 0; user-select: none; }
+  .sx-l3-mono--low  { color: rgba(244, 63, 94, 0.6); }
+  .sx-l3-mono--high { color: rgba(16, 185, 129, 0.5); }
+  .sx-ping-wrap { position: relative; display: inline-block; width: 6px; height: 6px; flex-shrink: 0; }
+  .sx-ping-wrap > .sx-dot { position: absolute; inset: 0; }
+  .sx-ping-wrap > .sx-ping { position: absolute; inset: 0; border-radius: 50%; background: #10b981; opacity: 0.75; animation: sx-ping 1.6s cubic-bezier(0,0,0.2,1) infinite; }
+  .sx-icon { width: 11px; height: 11px; stroke: currentColor; stroke-width: 2.2; fill: none; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+  .sx-icon--sm { width: 10px; height: 10px; }
+  .sx-icon--xs { width: 8px;  height: 8px;  }
   `;
-  return el;
+  (document.head || document.documentElement).appendChild(s);
+}
+
+// Lucide-style inline SVGs. Just the paths we use.
+const SX_ICONS = {
+  eye: '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>',
+  shieldAlert: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
+  alertTriangle: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  userCheck: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><polyline points="16 11 18 13 22 9"/>',
+  calendar: '<rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" x2="16" y1="2" y2="6"/><line x1="8" x2="8" y1="2" y2="6"/><line x1="3" x2="21" y1="10" y2="10"/>',
+  briefcase: '<rect width="20" height="14" x="2" y="7" rx="2" ry="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
+  award: '<circle cx="12" cy="8" r="6"/><polyline points="15.477 12.89 17 22 12 19 7 22 8.523 12.89"/>',
+};
+function sxIcon(name, sizeClass) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'sx-icon' + (sizeClass ? ' ' + sizeClass : ''));
+  svg.innerHTML = SX_ICONS[name] || '';
+  return svg;
+}
+
+function sxEl(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+// View tier label + class — matches AI Studio design.
+function getViewTierBadge(views) {
+  if (views < 1000)   return { label: '<1K views',   cls: 'sx-tier-views-0', color: '#9ca3af', bg: 'rgba(156,163,175,0.05)', bd: 'rgba(156,163,175,0.10)', hero: false };
+  if (views < 5000)   return { label: '1K+ views',   cls: 'sx-tier-views-1', color: '#38bdf8', bg: 'rgba(56,189,248,0.05)',  bd: 'rgba(56,189,248,0.10)',  hero: false };
+  if (views < 10000)  return { label: '5K+ views',   cls: 'sx-tier-views-2', color: '#38bdf8', bg: 'rgba(56,189,248,0.10)',  bd: 'rgba(56,189,248,0.20)',  hero: false };
+  if (views < 100000) return { label: '10K+ views',  cls: 'sx-tier-views-3', color: '#a78bfa', bg: 'rgba(167,139,250,0.10)', bd: 'rgba(167,139,250,0.20)', hero: false };
+  if (views < 300000) return { label: '100K+ views', cls: 'sx-tier-views-4', color: '#c084fc', bg: 'rgba(192,132,252,0.15)', bd: 'rgba(192,132,252,0.30)', hero: true };
+  if (views < 500000) return { label: '300K+ views', cls: 'sx-tier-views-5', color: '#f472b6', bg: 'rgba(244,114,182,0.15)', bd: 'rgba(244,114,182,0.30)', hero: true };
+  return                      { label: '500K+ views', cls: 'sx-tier-views-6', color: '#fb7185', bg: 'rgba(251,113,133,0.20)', bd: 'rgba(244,63,94,0.30)',   hero: true };
+}
+function getFollowerTierBadge(count) {
+  if (count < 1500)  return { label: '<1.5K', color: '#f87171', bg: 'rgba(239,68,68,0.10)',  bd: 'rgba(239,68,68,0.20)' };
+  if (count < 2000)  return { label: '1.5K+', color: '#f59e0b', bg: 'rgba(245,158,11,0.10)', bd: 'rgba(245,158,11,0.20)' };
+  if (count < 3000)  return { label: '2K+',   color: '#eab308', bg: 'rgba(234,179,8,0.10)',  bd: 'rgba(234,179,8,0.20)' };
+  if (count < 5000)  return { label: '3K+',   color: '#10b981', bg: 'rgba(16,185,129,0.05)', bd: 'rgba(16,185,129,0.10)' };
+  if (count < 10000) return { label: '5K+',   color: '#34d399', bg: 'rgba(16,185,129,0.10)', bd: 'rgba(16,185,129,0.20)' };
+  return                      { label: '10K+', color: '#2dd4bf', bg: 'rgba(20,184,166,0.10)', bd: 'rgba(20,184,166,0.20)' };
 }
 
 function injectHUD(tweetEl, screenName) {
@@ -304,112 +531,204 @@ function injectHUD(tweetEl, screenName) {
   const u = userCache.get(screenName);
   if (!u) return;
 
-  const tier = getTier(u.followers);
-  const flag = u.country ? (COUNTRY_FLAGS[u.country] || '') : '';
-  const HIGH_VALUE = new Set(['VC','Founder','Co-Founder','CEO','Angel','Investor','YC','a16z','Sequoia','Partner','GP']);
-
-  // ── Find the cellInnerDiv wrapper ABOVE the article ──
-  // X structure: div[data-testid="cellInnerDiv"] > div > article
   const cellInner = tweetEl.closest('[data-testid="cellInnerDiv"]');
   if (!cellInner) return;
 
-  // ── Left border = follower tier color ──
-  cellInner.style.borderLeft = tier.min > 0 ? `3px solid ${tier.border}` : '';
+  ensureStyles();
 
-  // ══════════════════════════════════════
-  //  TOP STRIP: flag, followers, ratio, tags
-  // ══════════════════════════════════════
-  const top = makeStrip('top');
+  const tweetId = extractTweetId(tweetEl);
+  const engagement = tweetId ? tweetCache.get(tweetId) : null;
+  const sig = computeSignal(u, engagement);
+  const tier = sig.score >= 8 ? 'high' : sig.score < 3 ? 'low' : 'mid';
+  const followerTier = getFollowerTierBadge(u.followers);
+  const viewTier = engagement ? getViewTierBadge(engagement.views) : null;
+  const flag = u.country ? (COUNTRY_FLAGS[u.country] || '') : '';
 
-  // Flag + country
-  if (flag || u.location) {
-    const loc = document.createElement('span');
-    loc.style.cssText = `font-size:11px;font-weight:600;color:${u.country === 'United States' ? '#1D9BF0' : '#8B98A5'};white-space:nowrap;`;
-    loc.textContent = flag ? `${flag} ${u.country}` : u.location;
-    top.appendChild(loc);
+  // Clear any old border/opacity styling from previous builds.
+  cellInner.style.borderLeft = '';
+  cellInner.style.borderRight = '';
+  cellInner.style.opacity = '';
+
+  const hud = sxEl('div', `sx-hud sx-hud--${tier}`);
+  hud.setAttribute('data-signalx-hud', 'strip');
+
+  // ── Primary row ──
+  const r1 = sxEl('div', 'sx-row sx-row--spread');
+
+  const left1 = sxEl('div', 'sx-row');
+  // Signal score pill — the headline.
+  const scorePill = sxEl('div', `sx-pill sx-pill--score sx-pill--score-${tier}`);
+  const scoreDot = sxEl('span', 'sx-dot' + (tier === 'high' ? ' sx-dot--pulse' : ''));
+  scoreDot.style.background = tier === 'high' ? '#34d399' : tier === 'low' ? '#fb7185' : '#a3a3a3';
+  scorePill.appendChild(scoreDot);
+  scorePill.appendChild(document.createTextNode('SIG: ' + sig.score));
+  left1.appendChild(scorePill);
+
+  // Verification: legacy = amber, blue = cyan.
+  if (u.isVerified) {
+    left1.appendChild(sxEl('span', 'sx-pill sx-pill--legacy', 'Legacy ✓'));
+  } else if (u.isBlueVerified) {
+    left1.appendChild(sxEl('span', 'sx-pill sx-pill--blue', 'Premium Blue'));
   }
 
-  // Follower count (tier-colored)
-  const fc = document.createElement('span');
-  fc.style.cssText = `font-size:11px;font-weight:700;color:${tier.color};display:inline-flex;align-items:center;gap:3px;`;
-  fc.textContent = compact(u.followers);
-  if (tier.min >= 1500) {
-    const dot = document.createElement('span');
-    dot.style.cssText = `width:5px;height:5px;border-radius:50%;background:${tier.color};display:inline-block;`;
-    fc.appendChild(dot);
+  // Relationship
+  const relLabel = u.followsYou && u.youFollow ? 'mutual follows' : u.youFollow ? 'you follow' : u.followsYou ? 'follows you' : null;
+  if (relLabel) {
+    const relPill = sxEl('span', 'sx-pill sx-pill--rel');
+    relPill.appendChild(sxIcon('userCheck', 'sx-icon--sm'));
+    relPill.appendChild(document.createTextNode(relLabel));
+    left1.appendChild(relPill);
   }
-  top.appendChild(fc);
 
-  // Ratio
+  // Org affiliation
+  if (u.affiliateLabel) {
+    const org = sxEl('span', 'sx-pill sx-pill--org');
+    org.appendChild(sxIcon('award', 'sx-icon--sm'));
+    org.appendChild(document.createTextNode(u.affiliateLabel));
+    left1.appendChild(org);
+  }
+
+  // Country flag
+  if (flag) {
+    const f = sxEl('span', 'sx-pill sx-pill--flag');
+    f.appendChild(document.createTextNode(flag + ' ' + (u.country || '')));
+    left1.appendChild(f);
+  }
+
+  r1.appendChild(left1);
+
+  // Right: view pill (hero)
+  if (viewTier) {
+    const right1 = sxEl('div', 'sx-row');
+    const v = sxEl('div', 'sx-pill sx-pill--view');
+    v.style.color = viewTier.color;
+    v.style.background = viewTier.bg;
+    v.style.borderColor = viewTier.bd;
+    if (viewTier.hero) v.style.fontWeight = '700';
+    v.appendChild(sxIcon('eye', 'sx-icon--sm'));
+    v.appendChild(document.createTextNode(viewTier.label));
+    right1.appendChild(v);
+    r1.appendChild(right1);
+  }
+
+  hud.appendChild(r1);
+
+  // ── Secondary row ──
+  const r2 = sxEl('div', 'sx-row sx-row--secondary sx-row--spread');
+  const left2 = sxEl('div', 'sx-row sx-row--secondary');
+
+  // Audience
+  const aud = sxEl('span', 'sx-stat');
+  aud.appendChild(sxEl('span', 'sx-stat-label', 'Audience:'));
+  const audPill = sxEl('span', 'sx-pill');
+  audPill.style.color = followerTier.color;
+  audPill.style.background = followerTier.bg;
+  audPill.style.borderColor = followerTier.bd;
+  audPill.style.fontSize = '9px';
+  audPill.style.padding = '1px 4px';
+  audPill.textContent = compact(u.followers) + ' (' + followerTier.label + ')';
+  aud.appendChild(audPill);
+  left2.appendChild(aud);
+
+  // Ratio (only ≥ 2x)
   if (u.ratio >= 2) {
-    const r = document.createElement('span');
-    r.style.cssText = 'font-size:10px;color:#8B98A5;font-weight:500;';
-    r.textContent = `${u.ratio.toFixed(1)}x ratio`;
-    top.appendChild(r);
+    const r = sxEl('span', 'sx-stat');
+    r.appendChild(sxEl('span', 'sx-stat-label', 'Ratio:'));
+    r.appendChild(sxEl('span', 'sx-stat-val--accent', u.ratio.toFixed(1) + 'x'));
+    left2.appendChild(r);
   }
 
-  // Bio tags
-  for (const tag of u.bioTags) {
-    const isHV = HIGH_VALUE.has(tag);
-    top.appendChild(makePill(
-      tag,
-      isHV ? 'rgba(212,160,23,0.15)' : 'rgba(134,142,150,0.10)',
-      isHV ? '#D4A017' : '#8B98A5',
-    ));
-  }
-
-  // ══════════════════════════════════════
-  //  BOTTOM STRIP: age, lists, tweets, relationship, verification
-  // ══════════════════════════════════════
-  const bot = makeStrip('bottom');
-
+  // Age
   if (u.age) {
-    const age = document.createElement('span');
-    age.style.cssText = 'font-size:10px;color:#6B7280;';
-    age.textContent = `\u{1F4C5} ${u.age} old`;
-    bot.appendChild(age);
+    const age = sxEl('span', 'sx-stat');
+    age.appendChild(sxIcon('calendar', 'sx-icon--sm'));
+    age.appendChild(sxEl('span', 'sx-stat-label', 'Age:'));
+    age.appendChild(sxEl('span', 'sx-stat-val', u.age));
+    left2.appendChild(age);
   }
 
-  if (u.listed > 0) {
-    bot.appendChild(makeDot());
-    const ls = document.createElement('span');
-    ls.style.cssText = 'font-size:10px;color:#6B7280;';
-    ls.textContent = `${compact(u.listed)} lists`;
-    bot.appendChild(ls);
+  // Listed (≥10)
+  if (u.listed >= 10) {
+    const l = sxEl('span', 'sx-stat');
+    l.appendChild(sxEl('span', 'sx-stat-label', 'Listed:'));
+    l.appendChild(sxEl('span', 'sx-stat-val', String(u.listed)));
+    left2.appendChild(l);
   }
 
-  bot.appendChild(makeDot());
-  const tw = document.createElement('span');
-  tw.style.cssText = 'font-size:10px;color:#6B7280;';
-  tw.textContent = `${compact(u.tweets)} tweets`;
-  bot.appendChild(tw);
-
-  if (u.media > 0) {
-    bot.appendChild(makeDot());
-    const md = document.createElement('span');
-    md.style.cssText = 'font-size:10px;color:#6B7280;';
-    md.textContent = `${compact(u.media)} media`;
-    bot.appendChild(md);
+  // Media (≥100)
+  if (u.media >= 100) {
+    const m = sxEl('span', 'sx-stat');
+    m.appendChild(sxEl('span', 'sx-stat-label', 'Media:'));
+    m.appendChild(sxEl('span', 'sx-stat-val', compact(u.media)));
+    left2.appendChild(m);
   }
 
-  // Spacer pushes badges to the right
-  const spacer = document.createElement('span');
-  spacer.style.cssText = 'flex:1;';
-  bot.appendChild(spacer);
+  // Professional type
+  if (u.professionalType) {
+    const p = sxEl('span', 'sx-pill sx-pill--prof');
+    p.appendChild(sxIcon('briefcase', 'sx-icon--xs'));
+    p.appendChild(document.createTextNode(u.professionalType));
+    left2.appendChild(p);
+  } else if (u.verifiedType === 'Business') {
+    const p = sxEl('span', 'sx-pill sx-pill--prof');
+    p.appendChild(sxIcon('briefcase', 'sx-icon--xs'));
+    p.appendChild(document.createTextNode('Business'));
+    left2.appendChild(p);
+  }
 
-  // Relationship & verification badges (right-aligned)
-  if (u.followsYou) bot.appendChild(makePill('Follows you', 'rgba(47,158,68,0.12)', '#2F9E44'));
-  if (u.isBlueVerified) bot.appendChild(makePill('\u2713 Blue', 'rgba(29,155,240,0.12)', '#1D9BF0'));
-  if (u.professionalType) bot.appendChild(makePill(u.professionalType, 'rgba(134,142,150,0.10)', '#8B98A5'));
-  if (u.defaultAvatar) bot.appendChild(makePill('\u26A0 No pic', 'rgba(232,89,12,0.12)', '#E8590C'));
+  r2.appendChild(left2);
 
-  // ── Insert: top strip before article, bottom strip after article ──
+  // Right: bio tags
+  const right2 = sxEl('div', 'sx-row');
+  right2.style.gap = '6px';
+  const HV = new Set(['VC', 'Founder', 'CEO', 'YC', 'Engineer', 'Researcher']);
+  for (const tag of u.bioTags) {
+    const t = sxEl('span', 'sx-tag ' + (HV.has(tag) ? 'sx-tag--hv' : 'sx-tag--reg'), tag);
+    right2.appendChild(t);
+  }
+  r2.appendChild(right2);
+
+  hud.appendChild(r2);
+
+  // ── Level 3 bar (conditional) ──
+  if (tier === 'low' || (engagement && engagement.visibilityLimited)) {
+    const l3 = sxEl('div', 'sx-l3 sx-l3--low');
+    const l3l = sxEl('div', 'sx-row');
+    const limited = engagement && engagement.visibilityLimited;
+    const icon = limited ? sxIcon('shieldAlert', 'sx-icon--sm') : sxIcon('alertTriangle', 'sx-icon--sm');
+    if (limited) icon.style.animation = 'sx-pulse 1.6s ease-in-out infinite';
+    l3l.appendChild(icon);
+    const inner = sxEl('div', 'sx-row');
+    inner.style.gap = '4px';
+    inner.appendChild(sxEl('span', 'sx-l3-label sx-l3-label--low', limited ? 'LIMIT ACTIVE:' : 'NOISE WARNING:'));
+    inner.appendChild(sxEl('span', null, sig.reasons.slice(0, 3).join(', ') || 'low credibility profile'));
+    l3l.appendChild(inner);
+    l3.appendChild(l3l);
+    l3.appendChild(sxEl('span', 'sx-l3-mono sx-l3-mono--low', 'x_api_intercept'));
+    hud.appendChild(l3);
+  } else if (tier === 'high') {
+    const l3 = sxEl('div', 'sx-l3 sx-l3--high');
+    const l3l = sxEl('div', 'sx-row');
+    const pingWrap = sxEl('span', 'sx-ping-wrap');
+    pingWrap.appendChild(sxEl('span', 'sx-ping'));
+    const innerDot = sxEl('span', 'sx-dot');
+    innerDot.style.background = '#10b981';
+    pingWrap.appendChild(innerDot);
+    l3l.appendChild(pingWrap);
+    const msg = sxEl('span', null, '');
+    msg.appendChild(document.createTextNode('High-Signal verified route: '));
+    const strong = sxEl('strong', null, sig.reasons.slice(0, 2).join(' & ') || 'established reputation');
+    msg.appendChild(strong);
+    l3l.appendChild(msg);
+    l3.appendChild(l3l);
+    l3.appendChild(sxEl('span', 'sx-l3-mono sx-l3-mono--high', 'vetted_account'));
+    hud.appendChild(l3);
+  }
+
   observerPaused = true;
-  cellInner.insertBefore(top, cellInner.firstChild);
-  cellInner.appendChild(bot);
+  cellInner.insertBefore(hud, cellInner.firstChild);
   observerPaused = false;
 }
-
 let hudPending = false;
 function hudAllTweets() {
   if (hudPending) return;
@@ -447,11 +766,13 @@ XMLHttpRequest.prototype.send = function (...args) {
         url.includes('TweetDetail') || url.includes('UserByScreenName')) {
       try {
         const data = JSON.parse(this.responseText);
-        const before = userCache.size;
+        const uBefore = userCache.size;
+        const tBefore = tweetCache.size;
         findUsersInResponse(data, 0);
-        const added = userCache.size - before;
-        if (added > 0) {
-          console.log(`[Signal X] +${added} users cached (total: ${userCache.size})`);
+        const uAdded = userCache.size - uBefore;
+        const tAdded = tweetCache.size - tBefore;
+        if (uAdded > 0 || tAdded > 0) {
+          console.log(`[Signal X] +${uAdded} users, +${tAdded} tweets (totals: ${userCache.size}u / ${tweetCache.size}t)`);
           requestAnimationFrame(hudAllTweets);
         }
       } catch {}
@@ -471,11 +792,13 @@ window.fetch = async function (...args) {
     try {
       const clone = response.clone();
       clone.json().then(data => {
-        const before = userCache.size;
+        const uBefore = userCache.size;
+        const tBefore = tweetCache.size;
         findUsersInResponse(data, 0);
-        const added = userCache.size - before;
-        if (added > 0) {
-          console.log(`[Signal X][fetch] +${added} users cached (total: ${userCache.size})`);
+        const uAdded = userCache.size - uBefore;
+        const tAdded = tweetCache.size - tBefore;
+        if (uAdded > 0 || tAdded > 0) {
+          console.log(`[Signal X][fetch] +${uAdded} users, +${tAdded} tweets (totals: ${userCache.size}u / ${tweetCache.size}t)`);
           requestAnimationFrame(hudAllTweets);
         }
       }).catch(() => {});
