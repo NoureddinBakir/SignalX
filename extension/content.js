@@ -937,8 +937,17 @@ function renderStatsPanel() {
   // Title
   const title = document.createElement('div');
   title.className = 'sx-stats__title';
-  title.appendChild(Object.assign(document.createElement('span'), { textContent: 'Signal X · Live' }));
-  title.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__pulse' }));
+  const titleLeft = document.createElement('span');
+  titleLeft.style.cssText = 'display:flex;align-items:center;gap:7px;';
+  titleLeft.appendChild(Object.assign(document.createElement('span'), { textContent: 'Signal X · Live' }));
+  titleLeft.appendChild(Object.assign(document.createElement('span'), { className: 'sx-stats__pulse' }));
+  title.appendChild(titleLeft);
+  const zenBtn = document.createElement('button');
+  zenBtn.textContent = '⊕ Zen';
+  zenBtn.style.cssText = 'background:rgba(29,155,240,0.12);color:#1D9BF0;border:1px solid rgba(29,155,240,0.25);border-radius:999px;padding:2px 10px;font-size:10px;font-weight:700;cursor:pointer;text-transform:none;letter-spacing:0;';
+  zenBtn.title = 'Enter Zen mode (or press Z)';
+  zenBtn.onclick = () => window.__signalxToggleZen && window.__signalxToggleZen();
+  title.appendChild(zenBtn);
   statsPanelEl.appendChild(title);
 
   // ── Your profile ──
@@ -1132,4 +1141,394 @@ if (document.body) {
   });
 }
 
-console.log('[Signal X] HUD active — zero API calls, full intel on every tweet');
+// ═══════════════════════════════════════════════════════════════════════
+//  ZEN MODE — full-screen, one post at a time, inline reply, blank the rest
+// ═══════════════════════════════════════════════════════════════════════
+
+const SX_ZEN_STYLE_ID = 'signalx-zen-stylesheet';
+function ensureZenStyles() {
+  if (document.getElementById(SX_ZEN_STYLE_ID)) return;
+  const s = document.createElement('style');
+  s.id = SX_ZEN_STYLE_ID;
+  s.textContent = `
+    @keyframes sx-zen-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    #sx-zen {
+      position: fixed; inset: 0; z-index: 2147483600;
+      background: #000;
+      color: #e7e9ea;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+      display: flex; flex-direction: column; align-items: center;
+      overflow: hidden;
+    }
+    #sx-zen * { box-sizing: border-box; }
+    .sx-zen__stage {
+      flex: 1; width: 100%; display: flex; align-items: center; justify-content: center;
+      padding: 24px 20px; overflow-y: auto;
+    }
+    .sx-zen__card {
+      width: 100%; max-width: 640px;
+      animation: sx-zen-in 200ms ease;
+    }
+    .sx-zen__author { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .sx-zen__avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; background: #1a1a1a; flex-shrink: 0; filter: grayscale(1); }
+    .sx-zen__name { font-weight: 600; font-size: 15px; color: #e7e9ea; display: flex; align-items: center; gap: 5px; }
+    .sx-zen__handle { color: #6e6e6e; font-size: 14px; }
+    .sx-zen__text {
+      font-size: 24px; line-height: 1.45; color: #f4f4f4; margin: 20px 0 24px;
+      white-space: pre-wrap; word-wrap: break-word; font-weight: 400;
+    }
+    .sx-zen__text--long { font-size: 20px; }
+    .sx-zen__text--vlong { font-size: 17px; }
+    .sx-zen__media { width: 100%; border-radius: 12px; border: 1px solid #222; margin: 0 0 24px; max-height: 340px; object-fit: cover; filter: grayscale(1); }
+    .sx-zen__engage { display: flex; gap: 20px; font-size: 13px; color: #6e6e6e; margin-bottom: 10px; font-variant-numeric: tabular-nums; }
+    .sx-zen__engage b { color: #cfcfcf; font-weight: 500; }
+    .sx-zen__meta { font-size: 12px; color: #6e6e6e; margin-top: 4px; letter-spacing: 0.01em; }
+    .sx-zen__reply {
+      width: 100%; max-width: 640px; flex-shrink: 0;
+      padding: 16px 20px 26px;
+    }
+    .sx-zen__replybox {
+      width: 100%; min-height: 52px; max-height: 160px; resize: none;
+      background: #0a0a0a; border: 1px solid #262626; border-radius: 12px;
+      color: #f4f4f4; font-size: 16px; line-height: 1.4; padding: 14px 16px;
+      font-family: inherit; outline: none; transition: border-color 120ms ease;
+    }
+    .sx-zen__replybox:focus { border-color: #4d4d4d; }
+    .sx-zen__replybox::placeholder { color: #4d4d4d; }
+    .sx-zen__replyrow { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+    .sx-zen__hint { font-size: 12px; color: #4d4d4d; }
+    .sx-zen__hint kbd { font-family: ui-monospace, monospace; background: #141414; border: 1px solid #262626; border-radius: 4px; padding: 1px 5px; color: #6e6e6e; }
+    .sx-zen__send {
+      background: #e7e9ea; color: #000; border: none; border-radius: 999px;
+      padding: 8px 20px; font-size: 14px; font-weight: 600; cursor: pointer;
+      transition: opacity 120ms ease;
+    }
+    .sx-zen__send:hover { opacity: 0.85; }
+    .sx-zen__send:disabled { opacity: 0.3; cursor: default; }
+    .sx-zen__count { font-size: 12px; color: #6e6e6e; font-variant-numeric: tabular-nums; margin-right: 12px; }
+    .sx-zen__count--warn { color: #9e9e9e; }
+    .sx-zen__count--over { color: #e7e9ea; }
+    .sx-zen__toast {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      background: #0a0a0a; border: 1px solid #262626; color: #e7e9ea;
+      padding: 10px 18px; border-radius: 10px; font-size: 14px; z-index: 2147483601;
+      opacity: 0; transition: opacity 160ms ease;
+    }
+    .sx-zen__toast--show { opacity: 1; }
+    .sx-zen__empty { color: #4d4d4d; font-size: 16px; text-align: center; }
+    /* Hide X's native composer modal while we drive it from Zen. */
+    body.sx-zen-posting div[aria-labelledby][role="dialog"],
+    body.sx-zen-posting [data-testid="mask"] { opacity: 0 !important; pointer-events: none !important; }
+    body.sx-zen-on { overflow: hidden !important; }
+  `;
+  (document.head || document.documentElement).appendChild(s);
+}
+
+// ── small async helpers ──
+const sxSleep = (ms) => new Promise(r => setTimeout(r, ms));
+function sxWaitFor(selector, timeout = 4000) {
+  return new Promise((resolve, reject) => {
+    const found = document.querySelector(selector);
+    if (found) return resolve(found);
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      const el = document.querySelector(selector);
+      if (el) { clearInterval(iv); resolve(el); }
+      else if (Date.now() - t0 > timeout) { clearInterval(iv); reject(new Error('timeout: ' + selector)); }
+    }, 60);
+  });
+}
+function sxWaitGone(selector, timeout = 5000) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (!document.querySelector(selector) || Date.now() - t0 > timeout) { clearInterval(iv); resolve(); }
+    }, 80);
+  });
+}
+
+// ── Zen state ──
+let zenActive = false;
+let zenPosts = [];   // [{ article, handle }]
+let zenIndex = 0;
+let zenEl = null;
+
+function extractPostData(article) {
+  const handle = extractUsername(article);
+  const nameEl = article.querySelector('[data-testid="User-Name"]');
+  let name = '';
+  if (nameEl) {
+    const span = [...nameEl.querySelectorAll('span')].find(s => s.textContent && !s.textContent.startsWith('@'));
+    name = span ? span.textContent : '';
+  }
+  const textEl = article.querySelector('[data-testid="tweetText"]');
+  const text = textEl ? textEl.innerText : '';
+  const avatar = article.querySelector('img[src*="profile_images"]')?.src || '';
+  const media = article.querySelector('[data-testid="tweetPhoto"] img')?.src || '';
+  const tweetId = extractTweetId(article);
+  const engagement = tweetId ? tweetCache.get(tweetId) : null;
+  const user = handle ? userCache.get(handle) : null;
+  return { handle, name, text, avatar, media, tweetId, engagement, user, article };
+}
+
+function collectZenPosts() {
+  const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
+  const seen = new Set();
+  const posts = [];
+  for (const a of articles) {
+    const id = extractTweetId(a);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    posts.push({ article: a, id });
+  }
+  return posts;
+}
+
+function zenToast(msg, kind) {
+  let t = zenEl.querySelector('.sx-zen__toast');
+  if (!t) { t = document.createElement('div'); t.className = 'sx-zen__toast'; zenEl.appendChild(t); }
+  t.className = 'sx-zen__toast' + (kind ? ' sx-zen__toast--' + kind : '');
+  t.textContent = msg;
+  requestAnimationFrame(() => t.classList.add('sx-zen__toast--show'));
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('sx-zen__toast--show'), 2600);
+}
+
+function enterZen() {
+  if (zenActive) return;
+  ensureZenStyles();
+  zenPosts = collectZenPosts();
+  zenIndex = 0;
+  zenActive = true;
+  document.body.classList.add('sx-zen-on');
+
+  zenEl = document.createElement('div');
+  zenEl.id = 'sx-zen';
+  observerPaused = true;
+  document.body.appendChild(zenEl);
+  observerPaused = false;
+  zenRender();
+}
+
+function exitZen() {
+  if (!zenActive) return;
+  zenActive = false;
+  document.body.classList.remove('sx-zen-on');
+  if (zenEl && zenEl.parentNode) zenEl.parentNode.removeChild(zenEl);
+  zenEl = null;
+}
+
+function zenNext() {
+  if (zenIndex < zenPosts.length - 1) { zenIndex += 1; zenRender(); }
+  // Grow the queue when near the end by nudging the real timeline to paginate.
+  if (zenIndex >= zenPosts.length - 3) {
+    const y = window.scrollY;
+    window.scrollTo(0, document.body.scrollHeight);
+    setTimeout(() => {
+      window.scrollTo(0, y);
+      const fresh = collectZenPosts();
+      if (fresh.length > zenPosts.length) zenPosts = fresh;
+    }, 700);
+  }
+}
+function zenPrev() { if (zenIndex > 0) { zenIndex -= 1; zenRender(); } }
+
+function zenRender() {
+  if (!zenEl) return;
+  observerPaused = true;
+  zenEl.innerHTML = '';
+
+  const stage = document.createElement('div'); stage.className = 'sx-zen__stage';
+  zenEl.appendChild(stage);
+
+  if (!zenPosts.length) {
+    const empty = document.createElement('div'); empty.className = 'sx-zen__empty';
+    empty.textContent = 'No posts loaded yet. Scroll your timeline once, then open Zen.';
+    stage.appendChild(empty);
+    observerPaused = false;
+    return;
+  }
+
+  const post = extractPostData(zenPosts[zenIndex].article);
+  const u = post.user;
+  const sig = computeSignal(u, post.engagement);
+  const tier = sig.score >= 8 ? 'high' : sig.score < 3 ? 'low' : 'mid';
+
+  const card = document.createElement('div'); card.className = 'sx-zen__card';
+
+  // Author
+  const author = document.createElement('div'); author.className = 'sx-zen__author';
+  if (post.avatar) {
+    const img = document.createElement('img'); img.className = 'sx-zen__avatar'; img.src = post.avatar; author.appendChild(img);
+  }
+  const idCol = document.createElement('div');
+  const nm = document.createElement('div'); nm.className = 'sx-zen__name';
+  nm.appendChild(document.createTextNode(post.name || post.handle || 'Unknown'));
+  if (u && (u.isVerified || u.isBlueVerified)) nm.appendChild(Object.assign(document.createElement('span'), { textContent: '✓', style: 'color:#6e6e6e' }));
+  idCol.appendChild(nm);
+  idCol.appendChild(Object.assign(document.createElement('div'), { className: 'sx-zen__handle', textContent: post.handle ? '@' + post.handle : '' }));
+  author.appendChild(idCol);
+  card.appendChild(author);
+
+  // Text
+  const txt = document.createElement('div');
+  const len = post.text.length;
+  txt.className = 'sx-zen__text' + (len > 280 ? ' sx-zen__text--vlong' : len > 140 ? ' sx-zen__text--long' : '');
+  txt.textContent = post.text || '(no text)';
+  card.appendChild(txt);
+
+  // Media (single image preview)
+  if (post.media) {
+    const m = document.createElement('img'); m.className = 'sx-zen__media'; m.src = post.media; card.appendChild(m);
+  }
+
+  // Engagement
+  if (post.engagement) {
+    const e = post.engagement;
+    const eng = document.createElement('div'); eng.className = 'sx-zen__engage';
+    const items = [['views', e.views], ['likes', e.likes], ['RT', e.retweets], ['replies', e.replies]];
+    for (const [label, val] of items) {
+      const sp = document.createElement('span');
+      sp.innerHTML = `<b>${compact(val || 0)}</b> ${label}`;
+      eng.appendChild(sp);
+    }
+    card.appendChild(eng);
+  }
+
+  // Signal meta — one quiet gray line, no chips, no color.
+  if (u) {
+    const bits = [];
+    bits.push('signal ' + sig.score + '/10');
+    bits.push(compact(u.followers) + ' followers');
+    if (u.age) bits.push(u.age);
+    if (u.affiliateLabel) bits.push('@' + u.affiliateLabel);
+    const relLabel = u.followsYou && u.youFollow ? 'mutual' : u.youFollow ? 'you follow' : u.followsYou ? 'follows you' : '';
+    if (relLabel) bits.push(relLabel);
+    if (sig.score < 3 && sig.reasons.length) bits.push('noise: ' + sig.reasons.slice(0, 2).join(', '));
+    const meta = document.createElement('div'); meta.className = 'sx-zen__meta';
+    meta.textContent = bits.join('   ·   ');
+    card.appendChild(meta);
+  }
+
+  stage.appendChild(card);
+
+  // Reply box
+  const replyWrap = document.createElement('div'); replyWrap.className = 'sx-zen__reply';
+  const box = document.createElement('textarea');
+  box.className = 'sx-zen__replybox';
+  box.placeholder = post.handle ? `Reply to @${post.handle}…` : 'Reply…';
+  box.rows = 1;
+  box.addEventListener('input', () => {
+    box.style.height = 'auto';
+    box.style.height = Math.min(box.scrollHeight, 160) + 'px';
+    updateCount();
+  });
+  replyWrap.appendChild(box);
+
+  const row = document.createElement('div'); row.className = 'sx-zen__replyrow';
+  const hint = document.createElement('div'); hint.className = 'sx-zen__hint';
+  hint.innerHTML = '<kbd>J</kbd>/<kbd>K</kbd> navigate · <kbd>⌘↵</kbd> reply &amp; next · <kbd>S</kbd> skip · <kbd>Esc</kbd> exit';
+  const rightSide = document.createElement('div'); rightSide.style.cssText = 'display:flex;align-items:center;';
+  const count = document.createElement('span'); count.className = 'sx-zen__count'; count.textContent = '280';
+  const send = document.createElement('button'); send.className = 'sx-zen__send'; send.textContent = 'Reply';
+  send.disabled = true;
+  rightSide.appendChild(count); rightSide.appendChild(send);
+  row.appendChild(hint); row.appendChild(rightSide);
+  replyWrap.appendChild(row);
+  zenEl.appendChild(replyWrap);
+
+  function updateCount() {
+    const remaining = 280 - box.value.length;
+    count.textContent = String(remaining);
+    count.className = 'sx-zen__count' + (remaining < 0 ? ' sx-zen__count--over' : remaining < 20 ? ' sx-zen__count--warn' : '');
+    send.disabled = box.value.trim().length === 0 || remaining < 0;
+  }
+
+  async function doSend() {
+    const text = box.value.trim();
+    if (!text || text.length > 280) return;
+    send.disabled = true; send.textContent = 'Posting…';
+    try {
+      await postReply(zenPosts[zenIndex].article, text);
+      zenToast('Replied');
+      box.value = '';
+      setTimeout(() => zenNext(), 350);
+    } catch (e) {
+      console.warn('[Signal X] reply failed:', e.message);
+      zenToast('Reply failed — ' + e.message);
+      send.disabled = false; send.textContent = 'Reply';
+    }
+  }
+  send.onclick = doSend;
+  box._doSend = doSend;
+
+  // Autofocus so the user can start typing immediately.
+  setTimeout(() => box.focus(), 60);
+  observerPaused = false;
+}
+
+// Drive X's own composer to actually post the reply. No tokens, no API guessing.
+async function postReply(article, text) {
+  const replyBtn = article.querySelector('[data-testid="reply"]');
+  if (!replyBtn) throw new Error('no reply control');
+  document.body.classList.add('sx-zen-posting');
+  try {
+    replyBtn.click();
+    const box = await sxWaitFor('[data-testid="tweetTextarea_0"]', 5000);
+    box.focus();
+    // execCommand insertText fires the input events Draft.js needs.
+    const ok = document.execCommand('insertText', false, text);
+    if (!ok) {
+      // Fallback: dispatch a beforeinput/input pair.
+      box.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: text, bubbles: true, cancelable: true }));
+      box.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
+    }
+    await sxSleep(220);
+    const postBtn = await sxWaitFor('[data-testid="tweetButton"]', 3000);
+    if (postBtn.getAttribute('aria-disabled') === 'true') {
+      await sxSleep(300);
+    }
+    postBtn.click();
+    await sxWaitGone('[data-testid="tweetTextarea_0"]', 6000);
+  } finally {
+    document.body.classList.remove('sx-zen-posting');
+  }
+}
+
+// ── Keyboard: toggle + in-Zen navigation ──
+document.addEventListener('keydown', (e) => {
+  const typingInPage = ['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable;
+
+  // Toggle Zen with 'z' when NOT typing.
+  if (!zenActive && (e.key === 'z' || e.key === 'Z') && !typingInPage && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    enterZen();
+    return;
+  }
+  if (!zenActive) return;
+
+  const box = zenEl && zenEl.querySelector('.sx-zen__replybox');
+  const inReply = e.target === box;
+
+  if (e.key === 'Escape') { e.preventDefault(); exitZen(); return; }
+
+  // Cmd/Ctrl+Enter posts from the reply box.
+  if (inReply && (e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    e.preventDefault();
+    if (box._doSend) box._doSend();
+    return;
+  }
+
+  // Navigation keys work when not actively typing (or with no text yet).
+  const canNav = !inReply || box.value.length === 0;
+  if (canNav) {
+    if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); zenNext(); }
+    else if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); zenPrev(); }
+    else if (e.key === 's' || e.key === 'S') { e.preventDefault(); zenNext(); }
+  }
+}, true);
+
+// Expose a programmatic toggle for the stats-panel button.
+window.__signalxToggleZen = () => (zenActive ? exitZen() : enterZen());
+
+console.log('[Signal X] HUD active — zero API calls, full intel on every tweet. Press Z for Zen mode.');
