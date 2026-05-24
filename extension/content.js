@@ -236,6 +236,35 @@ function accountAgeMonths(createdAt) {
   return Math.floor((Date.now() - created) / (30.44 * 24 * 60 * 60 * 1000));
 }
 
+// The complete tweet body. Premium long-form ("note tweets") keep the full
+// text in note_tweet; classic tweets in legacy.full_text. We trim the trailing
+// media/quote t.co link using display_text_range so the prose reads clean.
+function tweetFullText(obj) {
+  const note = obj.note_tweet?.note_tweet_results?.result?.text;
+  if (note) return note;
+  let t = obj.legacy?.full_text || '';
+  const range = obj.legacy?.display_text_range;
+  if (Array.isArray(range) && range.length === 2) {
+    const chars = Array.from(t); // code-point safe (range is in code points)
+    t = chars.slice(range[0], range[1]).join('');
+  }
+  return t;
+}
+
+function extractQuoted(obj) {
+  const qr = obj.quoted_status_result?.result;
+  if (!qr) return null;
+  const qt = qr.tweet || qr; // unwrap TweetWithVisibilityResults
+  const qUser = qt.core?.user_results?.result;
+  const text = tweetFullText(qt);
+  if (!text && !qUser) return null;
+  return {
+    text,
+    name: qUser?.core?.name || '',
+    handle: qUser?.core?.screen_name || '',
+  };
+}
+
 function cacheTweet(obj, flags) {
   const id = obj.rest_id || obj.legacy?.id_str;
   if (!id) return;
@@ -247,7 +276,8 @@ function cacheTweet(obj, flags) {
     replies: obj.legacy?.reply_count ?? 0,
     quotes: obj.legacy?.quote_count ?? 0,
     bookmarks: obj.legacy?.bookmark_count ?? 0,
-    fullText: obj.legacy?.full_text || '',
+    fullText: tweetFullText(obj),
+    quoted: extractQuoted(obj),
     lang: obj.legacy?.lang || '',
     isQuote: obj.legacy?.is_quote_status || false,
     hasMedia: !!(obj.legacy?.entities?.media?.length || obj.legacy?.extended_entities?.media?.length),
@@ -1281,7 +1311,12 @@ function extractPostData(article) {
   const names = [...article.querySelectorAll('[data-testid="User-Name"]')];
   const texts = [...article.querySelectorAll('[data-testid="tweetText"]')];
   const name = nameFromEl(names[0]).name;
-  const text = texts[0] ? texts[0].innerText : '';
+  const tweetId = extractTweetId(article);
+  const engagement = tweetId ? tweetCache.get(tweetId) : null;
+  // Prefer the full text from the GraphQL payload — the DOM is truncated by
+  // X's "Show more" and clips long posts.
+  const domText = texts[0] ? texts[0].innerText : '';
+  const text = (engagement && engagement.fullText) || domText;
   const avatar = article.querySelector('img[src*="profile_images"]')?.src || '';
 
   // All photos (galleries included), de-duped.
@@ -1306,20 +1341,14 @@ function extractPostData(article) {
     card = { img: cimg, title: ctexts.slice(0, 2).join(' · ') };
   }
 
-  // Quoted sub-tweet: when an article carries a second tweetText, the trailing
-  // one (and trailing User-Name) belong to the embedded quote.
-  let quoted = null;
-  if (texts.length >= 2) {
+  // Quoted sub-tweet: prefer the GraphQL-cached quote (reliable), fall back to
+  // DOM scraping (a trailing second tweetText / User-Name) when not cached yet.
+  let quoted = (engagement && engagement.quoted) || null;
+  if (!quoted && texts.length >= 2) {
     const q = nameFromEl(names[names.length - 1]);
-    quoted = {
-      name: q.name,
-      handle: q.handle,
-      text: texts[texts.length - 1].innerText,
-    };
+    quoted = { name: q.name, handle: q.handle, text: texts[texts.length - 1].innerText };
   }
 
-  const tweetId = extractTweetId(article);
-  const engagement = tweetId ? tweetCache.get(tweetId) : null;
   const user = handle ? userCache.get(handle) : null;
   return { handle, name, text, avatar, images, hasVideo, videoPoster, card, quoted, tweetId, engagement, user, article };
 }
