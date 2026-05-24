@@ -1179,7 +1179,22 @@ function ensureZenStyles() {
     }
     .sx-zen__text--long { font-size: 20px; }
     .sx-zen__text--vlong { font-size: 17px; }
-    .sx-zen__media { width: 100%; border-radius: 12px; border: 1px solid #222; margin: 0 0 24px; max-height: 340px; object-fit: cover; filter: grayscale(1); }
+    .sx-zen__grid { display: grid; gap: 4px; margin: 0 0 22px; border-radius: 14px; overflow: hidden; border: 1px solid #222; }
+    .sx-zen__grid--1 { grid-template-columns: 1fr; }
+    .sx-zen__grid--2 { grid-template-columns: 1fr 1fr; }
+    .sx-zen__grid--3 { grid-template-columns: 1fr 1fr; }
+    .sx-zen__grid--3 .sx-zen__img:first-child { grid-row: span 2; }
+    .sx-zen__grid--4 { grid-template-columns: 1fr 1fr; }
+    .sx-zen__img { width: 100%; height: 100%; max-height: 420px; object-fit: cover; display: block; }
+    .sx-zen__grid--1 .sx-zen__img { max-height: 460px; }
+    .sx-zen__video { position: relative; margin: 0 0 22px; border-radius: 14px; overflow: hidden; border: 1px solid #222; cursor: pointer; }
+    .sx-zen__play { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 34px; color: #fff; background: rgba(0,0,0,0.25); text-shadow: 0 2px 8px rgba(0,0,0,0.6); }
+    .sx-zen__card-prev { margin: 0 0 22px; border: 1px solid #222; border-radius: 14px; overflow: hidden; }
+    .sx-zen__card-img { width: 100%; max-height: 240px; object-fit: cover; display: block; }
+    .sx-zen__card-title { padding: 10px 14px; font-size: 13px; color: #9e9e9e; }
+    .sx-zen__quote { margin: 0 0 22px; border: 1px solid #2a2a2a; border-radius: 14px; padding: 12px 14px; }
+    .sx-zen__quote-head { font-size: 13px; color: #9e9e9e; margin-bottom: 4px; font-weight: 500; }
+    .sx-zen__quote-text { font-size: 15px; line-height: 1.4; color: #cfcfcf; white-space: pre-wrap; }
     .sx-zen__engage { display: flex; gap: 20px; font-size: 13px; color: #6e6e6e; margin-bottom: 10px; font-variant-numeric: tabular-nums; }
     .sx-zen__engage b { color: #cfcfcf; font-weight: 500; }
     .sx-zen__meta { font-size: 12px; color: #6e6e6e; margin-top: 4px; letter-spacing: 0.01em; }
@@ -1253,22 +1268,60 @@ let zenPosts = [];   // [{ article, handle }]
 let zenIndex = 0;
 let zenEl = null;
 
+function nameFromEl(nameEl) {
+  if (!nameEl) return { name: '', handle: '' };
+  const spans = [...nameEl.querySelectorAll('span')];
+  const name = (spans.find(s => s.textContent && !s.textContent.startsWith('@')) || {}).textContent || '';
+  const handle = (spans.find(s => s.textContent && s.textContent.startsWith('@')) || {}).textContent || '';
+  return { name, handle: handle.replace(/^@/, '') };
+}
+
 function extractPostData(article) {
   const handle = extractUsername(article);
-  const nameEl = article.querySelector('[data-testid="User-Name"]');
-  let name = '';
-  if (nameEl) {
-    const span = [...nameEl.querySelectorAll('span')].find(s => s.textContent && !s.textContent.startsWith('@'));
-    name = span ? span.textContent : '';
-  }
-  const textEl = article.querySelector('[data-testid="tweetText"]');
-  const text = textEl ? textEl.innerText : '';
+  const names = [...article.querySelectorAll('[data-testid="User-Name"]')];
+  const texts = [...article.querySelectorAll('[data-testid="tweetText"]')];
+  const name = nameFromEl(names[0]).name;
+  const text = texts[0] ? texts[0].innerText : '';
   const avatar = article.querySelector('img[src*="profile_images"]')?.src || '';
-  const media = article.querySelector('[data-testid="tweetPhoto"] img')?.src || '';
+
+  // All photos (galleries included), de-duped.
+  const images = [...new Set(
+    [...article.querySelectorAll('[data-testid="tweetPhoto"] img')].map(i => i.src).filter(Boolean)
+  )];
+
+  // Video: show its poster frame (we can't replay X's HLS stream inline).
+  const videoEl = article.querySelector('[data-testid="videoPlayer"], video');
+  const videoPoster =
+    article.querySelector('[data-testid="videoPlayer"] video')?.getAttribute('poster') ||
+    article.querySelector('[data-testid="videoComponent"] img')?.src ||
+    article.querySelector('[data-testid="previewInterstitial"] img')?.src || '';
+  const hasVideo = !!videoEl;
+
+  // Link / quote card preview.
+  const cardEl = article.querySelector('[data-testid="card.wrapper"]');
+  let card = null;
+  if (cardEl) {
+    const cimg = cardEl.querySelector('img')?.src || '';
+    const ctexts = [...cardEl.querySelectorAll('span')].map(s => s.textContent.trim()).filter(Boolean);
+    card = { img: cimg, title: ctexts.slice(0, 2).join(' · ') };
+  }
+
+  // Quoted sub-tweet: when an article carries a second tweetText, the trailing
+  // one (and trailing User-Name) belong to the embedded quote.
+  let quoted = null;
+  if (texts.length >= 2) {
+    const q = nameFromEl(names[names.length - 1]);
+    quoted = {
+      name: q.name,
+      handle: q.handle,
+      text: texts[texts.length - 1].innerText,
+    };
+  }
+
   const tweetId = extractTweetId(article);
   const engagement = tweetId ? tweetCache.get(tweetId) : null;
   const user = handle ? userCache.get(handle) : null;
-  return { handle, name, text, avatar, media, tweetId, engagement, user, article };
+  return { handle, name, text, avatar, images, hasVideo, videoPoster, card, quoted, tweetId, engagement, user, article };
 }
 
 function collectZenPosts() {
@@ -1314,6 +1367,11 @@ function exitZen() {
   if (!zenActive) return;
   zenActive = false;
   document.body.classList.remove('sx-zen-on');
+  // Drop the user back on the timeline at the post they were reading.
+  const cur = zenPosts[zenIndex] && zenPosts[zenIndex].article;
+  if (cur && document.contains(cur)) {
+    try { cur.scrollIntoView({ block: 'center' }); } catch {}
+  }
   if (zenEl && zenEl.parentNode) zenEl.parentNode.removeChild(zenEl);
   zenEl = null;
 }
@@ -1354,6 +1412,14 @@ function zenRender() {
   const sig = computeSignal(u, post.engagement);
   const tier = sig.score >= 8 ? 'high' : sig.score < 3 ? 'low' : 'mid';
 
+  // Open the full thread in a new tab — keeps this Zen tab's scroll + state intact.
+  function openThread() {
+    if (!post.tweetId) return;
+    const url = `https://x.com/${post.handle || 'i'}/status/${post.tweetId}`;
+    window.open(url, '_blank', 'noopener');
+  }
+  zenEl._openThread = openThread;
+
   const card = document.createElement('div'); card.className = 'sx-zen__card';
 
   // Author
@@ -1377,9 +1443,44 @@ function zenRender() {
   txt.textContent = post.text || '(no text)';
   card.appendChild(txt);
 
-  // Media (single image preview)
-  if (post.media) {
-    const m = document.createElement('img'); m.className = 'sx-zen__media'; m.src = post.media; card.appendChild(m);
+  // Media: photos (grid), video poster, link card.
+  if (post.images.length) {
+    const grid = document.createElement('div');
+    grid.className = 'sx-zen__grid sx-zen__grid--' + Math.min(post.images.length, 4);
+    for (const src of post.images.slice(0, 4)) {
+      const im = document.createElement('img'); im.className = 'sx-zen__img'; im.src = src; im.loading = 'lazy';
+      grid.appendChild(im);
+    }
+    card.appendChild(grid);
+  }
+  if (post.hasVideo) {
+    const vw = document.createElement('div'); vw.className = 'sx-zen__video';
+    if (post.videoPoster) {
+      const vp = document.createElement('img'); vp.className = 'sx-zen__img'; vp.src = post.videoPoster; vw.appendChild(vp);
+    }
+    const play = document.createElement('div'); play.className = 'sx-zen__play'; play.textContent = '▶';
+    vw.appendChild(play);
+    vw.title = 'Open on X to play';
+    vw.onclick = openThread;
+    card.appendChild(vw);
+  }
+  if (post.card) {
+    const c = document.createElement('div'); c.className = 'sx-zen__card-prev';
+    if (post.card.img) {
+      const ci = document.createElement('img'); ci.className = 'sx-zen__card-img'; ci.src = post.card.img; c.appendChild(ci);
+    }
+    if (post.card.title) c.appendChild(Object.assign(document.createElement('div'), { className: 'sx-zen__card-title', textContent: post.card.title }));
+    card.appendChild(c);
+  }
+
+  // Quoted sub-tweet.
+  if (post.quoted) {
+    const q = document.createElement('div'); q.className = 'sx-zen__quote';
+    const qh = document.createElement('div'); qh.className = 'sx-zen__quote-head';
+    qh.textContent = (post.quoted.name || '') + (post.quoted.handle ? ' @' + post.quoted.handle : '');
+    q.appendChild(qh);
+    q.appendChild(Object.assign(document.createElement('div'), { className: 'sx-zen__quote-text', textContent: post.quoted.text }));
+    card.appendChild(q);
   }
 
   // Engagement
@@ -1427,7 +1528,7 @@ function zenRender() {
 
   const row = document.createElement('div'); row.className = 'sx-zen__replyrow';
   const hint = document.createElement('div'); hint.className = 'sx-zen__hint';
-  hint.innerHTML = '<kbd>J</kbd>/<kbd>K</kbd> navigate · <kbd>⌘↵</kbd> reply &amp; next · <kbd>S</kbd> skip · <kbd>Esc</kbd> exit';
+  hint.innerHTML = '<kbd>J</kbd>/<kbd>K</kbd> navigate · <kbd>⌘↵</kbd> reply · <kbd>O</kbd> thread · <kbd>S</kbd> skip · <kbd>Esc</kbd> exit';
   const rightSide = document.createElement('div'); rightSide.style.cssText = 'display:flex;align-items:center;';
   const count = document.createElement('span'); count.className = 'sx-zen__count'; count.textContent = '280';
   const send = document.createElement('button'); send.className = 'sx-zen__send'; send.textContent = 'Reply';
@@ -1525,6 +1626,7 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'j' || e.key === 'ArrowDown') { e.preventDefault(); zenNext(); }
     else if (e.key === 'k' || e.key === 'ArrowUp') { e.preventDefault(); zenPrev(); }
     else if (e.key === 's' || e.key === 'S') { e.preventDefault(); zenNext(); }
+    else if (e.key === 'o' || e.key === 'O') { e.preventDefault(); if (zenEl && zenEl._openThread) zenEl._openThread(); }
   }
 }, true);
 
